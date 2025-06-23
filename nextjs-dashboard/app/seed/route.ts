@@ -2,13 +2,17 @@ import bcrypt from 'bcrypt';
 import postgres from 'postgres';
 import { invoices, customers, revenue, users } from '../lib/placeholder-data';
 
-// Configure PostgreSQL connection with explicit SSL and connection limits
-const sql = postgres(process.env.POSTGRES_URL!, {
-  ssl: { rejectUnauthorized: false },
+const sql = postgres(process.env.POSTGRES_URL_NON_POOLING!, { // Use NON_POOLING URL
+  ssl: { 
+    rejectUnauthorized: false // Temporary for debugging
+  },
   max: 1,
-  idle_timeout: 20,
-  connect_timeout: 10,
+  idle_timeout: 30,
+  connection: {
+    application_name: 'nextjs-seeding' // Helps identify connection
+  }
 });
+
 
 async function ensureExtensions() {
   try {
