@@ -4,10 +4,10 @@ import { invoices, customers, revenue, users } from '../lib/placeholder-data';
 
 // Configure PostgreSQL connection with explicit SSL and connection limits
 const sql = postgres(process.env.POSTGRES_URL!, {
-  ssl: 'require',
-  max: 1, // Use a single connection for seeding
-  idle_timeout: 20, // Close idle connections quickly
-  connect_timeout: 10, // Fail fast if connection can't be established
+  ssl: { rejectUnauthorized: false },
+  max: 1,
+  idle_timeout: 20,
+  connect_timeout: 10,
 });
 
 async function ensureExtensions() {
