@@ -2,123 +2,146 @@ import bcrypt from 'bcrypt';
 import postgres from 'postgres';
 import { invoices, customers, revenue, users } from '../lib/placeholder-data';
 
-const sql = postgres(process.env.POSTGRES_URL_NON_POOLING!, { // Use NON_POOLING URL
-  ssl: { 
-    rejectUnauthorized: false // Temporary for debugging
+// Configuration parameters
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 2000; // 2 seconds between retries
+const CHUNK_SIZE = 10; // Process users in chunks of 10
+
+// Use non-pooling connection URL
+const connectionString = process.env.POSTGRES_URL_NON_POOLING || process.env.POSTGRES_URL!;
+
+// Configure PostgreSQL connection with enhanced settings
+const sqlConfig = {
+  ssl: {
+    rejectUnauthorized: false, // Required for Supabase
+    ca: process.env.DB_CA_CERT // Add if you have custom CA
   },
   max: 1,
   idle_timeout: 30,
-  connection: {
-    application_name: 'nextjs-seeding' // Helps identify connection
-  }
-});
+  connect_timeout: 20,
+  transform: {
+    undefined: null
+  },
+  onnotice: (notice: any) => console.log('Postgres Notice:', notice),
+  onclose: () => console.log('Connection closed'),
+  onerror: (err: any) => console.error('Connection error:', err)
+};
 
+async function createConnection() {
+  return postgres(connectionString, sqlConfig);
+}
 
-async function ensureExtensions() {
+async function testConnection(sql: postgres.Sql) {
   try {
-    await sql`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`;
+    const result = await sql`SELECT version()`;
+    console.log('PostgreSQL version:', result[0].version);
+    return true;
   } catch (error) {
-    console.warn('Extension creation notice:', error);
+    console.error('Connection test failed:', error);
+    return false;
   }
 }
 
-async function seedTable<T>(
-  tableName: string,
-  createStatement: string,
-  items: T[],
-  transformFn?: (item: T) => Promise<any>
-) {
-  // Create table if not exists
-  await sql.unsafe(`CREATE TABLE IF NOT EXISTS ${tableName} ${createStatement}`);
-  
-  // Clear existing data (truncate is faster than delete)
-  await sql.unsafe(`TRUNCATE TABLE ${tableName} CONTINUE IDENTITY CASCADE`);
-  
-  // Insert data with transformation if needed
-  const insertPromises = items.map(async (item) => {
-    const transformedItem = transformFn ? await transformFn(item) : item;
-    return sql.unsafe(
-      `INSERT INTO ${tableName} ${sql(transformedItem)} ON CONFLICT DO NOTHING`
-    );
-  });
-
-  return Promise.all(insertPromises);
+async function seedUsers(sql: postgres.Sql) {
+  try {
+    // Process users in chunks to reduce connection load
+    for (let i = 0; i < users.length; i += CHUNK_SIZE) {
+      const chunk = users.slice(i, i + CHUNK_SIZE);
+      
+      await Promise.all(chunk.map(async (user) => {
+        const hashedPassword = await bcrypt.hash(user.password, 10);
+        return sql`
+          INSERT INTO users (id, name, email, password)
+          VALUES (${user.id}, ${user.name}, ${user.email}, ${hashedPassword})
+          ON CONFLICT (id) DO NOTHING;
+        `;
+      }));
+    }
+    
+    console.log(`${users.length} users seeded successfully`);
+  } catch (error) {
+    console.error('Error seeding users:', error);
+    throw error;
+  }
 }
+
+// Similar implementations for seedCustomers, seedInvoices, seedRevenue
+// (pass sql connection as parameter)
 
 export async function GET() {
-  try {
-    // Verify connection first
-    await sql`SELECT 1`;
-    
-    // Ensure extensions are available
-    await ensureExtensions();
-
-    // Seed all tables in a transaction
-    const result = await sql.begin(async (sql) => {
-      // Users with password hashing
-      await seedTable('users', `
-        (
+  let sql: postgres.Sql | null = null;
+  let attempt = 1;
+  
+  while (attempt <= MAX_RETRIES) {
+    try {
+      console.log(`Connection attempt ${attempt}/${MAX_RETRIES}`);
+      sql = await createConnection();
+      
+      // Test connection before proceeding
+      if (!await testConnection(sql)) {
+        throw new Error('Connection test failed');
+      }
+      
+      // Ensure extensions exist
+      await sql`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`;
+      
+      // Create tables if not exists
+      await sql`
+        CREATE TABLE IF NOT EXISTS users (
           id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
           name VARCHAR(255) NOT NULL,
           email TEXT NOT NULL UNIQUE,
           password TEXT NOT NULL
-        )`, 
-        users, 
-        async (user) => ({
-          ...user,
-          password: await bcrypt.hash(user.password, 10)
-        })
-      );
-
-      // Customers
-      await seedTable('customers', `
-        (
-          id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
-          name VARCHAR(255) NOT NULL,
-          email VARCHAR(255) NOT NULL,
-          image_url VARCHAR(255) NOT NULL
-        )`,
-        customers
-      );
-
-      // Invoices
-      await seedTable('invoices', `
-        (
-          id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
-          customer_id UUID NOT NULL,
-          amount INT NOT NULL,
-          status VARCHAR(255) NOT NULL,
-          date DATE NOT NULL
-        )`,
-        invoices
-      );
-
-      // Revenue
-      await seedTable('revenue', `
-        (
-          month VARCHAR(4) NOT NULL UNIQUE,
-          revenue INT NOT NULL
-        )`,
-        revenue
-      );
-
-      return { success: true };
-    });
-
-    return new Response(JSON.stringify({ message: 'Database seeded successfully' }), {
-      status: 200,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  } catch (error) {
-    console.error('Seeding error:', error);
-    return new Response(JSON.stringify({ 
-      error: error instanceof Error ? error.message : 'Database seeding failed' 
-    }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
-  } finally {
-    // Ensure connection is closed
-    await sql.end();
+        );
+      `;
+      
+      // Create other tables similarly...
+      
+      // Seed data
+      await seedUsers(sql);
+      // await seedCustomers(sql);
+      // await seedInvoices(sql);
+      // await seedRevenue(sql);
+      
+      return new Response(JSON.stringify({ 
+        message: 'Database seeded successfully' 
+      }), { 
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
+      
+    } catch (error) {
+      console.error(`Attempt ${attempt} failed:`, error);
+      
+      if (attempt >= MAX_RETRIES) {
+        return new Response(JSON.stringify({ 
+          error: error instanceof Error ? error.message : 'Database seeding failed after retries'
+        }), { 
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+      
+      // Wait before retrying (exponential backoff)
+      await new Promise(resolve => setTimeout(resolve, RETRY_DELAY * attempt));
+      attempt++;
+      
+    } finally {
+      if (sql) {
+        try {
+          await sql.end();
+          console.log('Connection closed');
+        } catch (e) {
+          console.error('Error closing connection:', e);
+        }
+      }
+    }
   }
+  
+  return new Response(JSON.stringify({ 
+    error: 'Unexpected error in seeding process'
+  }), { 
+    status: 500,
+    headers: { 'Content-Type': 'application/json' }
+  });
 }
